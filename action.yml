@@ -1,0 +1,128 @@
+name: CardScope link previews
+description: Call the CardScope API for each URL and write a markdown table of what each app will show.
+branding:
+  icon: eye
+  color: orange
+inputs:
+  urls:
+    description: URLs to check, one per line
+    required: true
+  api-key:
+    description: CardScope API key (cs_live_…)
+    required: true
+  platforms:
+    description: Comma-separated platform ids. Empty checks all 11.
+    required: false
+    default: ""
+  fail-on:
+    description: error, warning, or never
+    required: false
+    default: error
+  comment:
+    description: Post or update one pull request comment
+    required: false
+    default: "false"
+runs:
+  using: composite
+  steps:
+    - name: Check link previews
+      shell: bash
+      env:
+        URLS: ${{ inputs.urls }}
+        API_KEY: ${{ inputs.api-key }}
+        PLATFORMS: ${{ inputs.platforms }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        COMMENT: ${{ inputs.comment }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        case "$FAIL_ON" in
+          error|warning|never) ;;
+          *) echo "fail-on must be error, warning, or never" >&2; exit 2 ;;
+        esac
+        summary="${GITHUB_STEP_SUMMARY:-/tmp/cardscope-summary.md}"
+        : > "$summary"
+        report=""
+        failed=0
+        while IFS= read -r target || [[ -n "$target" ]]; do
+          target="$(printf '%s' "$target" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+          [[ -z "$target" || "$target" == \#* ]] && continue
+          encoded="$(jq -nr --arg u "$target" '$u|@uri')"
+          qs="url=${encoded}&source=action"
+          if [[ -n "$PLATFORMS" ]]; then
+            plats="$(jq -nr --arg u "$PLATFORMS" '$u|@uri')"
+            qs="${qs}&platforms=${plats}"
+          fi
+          body="$(curl -sS -w '\n%{http_code}' \
+            -H "Authorization: Bearer ${API_KEY}" \
+            -H "Accept: application/json" \
+            "https://cardscope.dev/v1/preview?${qs}")"
+          code="${body##*$'\n'}"
+          json="${body%$'\n'*}"
+          {
+            echo "## ${target}"
+            echo
+          } >> "$summary"
+          if [[ "$code" != "200" ]]; then
+            message="$(printf '%s' "$json" | jq -r '.message // "Preview failed."')"
+            echo "Fetch failed (${code}): ${message}" | tee -a "$summary"
+            echo >> "$summary"
+            report="${report}"$'\n'"### ${target}"$'\n\n'"${message}"$'\n'
+            failed=1
+            continue
+          fi
+          table="$(printf '%s' "$json" | jq -r '
+            def issues(id):
+              [.issues[]? | select(.severity == "error" or .severity == "warn") | select(.platforms | index(id))] | length;
+            ["| App | Layout | Title | Image | Issues |", "| --- | --- | --- | --- | --- |"]
+            + [.platforms[]? | "| \(.name) | \(.layout) | \(.title // "—") | \(if .image then "yes" else "no" end) | \(issues(.id)) |"]
+            | .[]
+          ')"
+          printf '%s\n\n' "$table" | tee -a "$summary"
+          report="${report}"$'\n'"### ${target}"$'\n\n'"${table}"$'\n'
+          if [[ "$FAIL_ON" == "error" ]]; then
+            n="$(printf '%s' "$json" | jq '[.issues[]? | select(.severity == "error")] | length')"
+            [[ "$n" != "0" ]] && failed=1
+          elif [[ "$FAIL_ON" == "warning" ]]; then
+            n="$(printf '%s' "$json" | jq '[.issues[]? | select(.severity == "error" or .severity == "warn")] | length')"
+            [[ "$n" != "0" ]] && failed=1
+          fi
+        done <<< "$URLS"
+
+        if [[ "$COMMENT" == "true" || "$COMMENT" == "True" ]]; then
+          pr=""
+          if [[ -n "${GITHUB_EVENT_PATH:-}" && -f "$GITHUB_EVENT_PATH" ]]; then
+            pr="$(jq -r '.pull_request.number // empty' "$GITHUB_EVENT_PATH")"
+          fi
+          if [[ -z "$pr" && "${GITHUB_REF:-}" == refs/pull/*/merge ]]; then
+            pr="$(printf '%s' "$GITHUB_REF" | cut -d/ -f3)"
+          fi
+          if [[ -n "$pr" && -n "${GITHUB_REPOSITORY:-}" && -n "${GH_TOKEN:-}" ]]; then
+            marker="<!-- cardscope-link-preview -->"
+            body="${marker}"$'\n'"## CardScope link previews"$'\n'"${report}"
+            existing="$(curl -sS \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${pr}/comments")"
+            cid="$(printf '%s' "$existing" | jq -r --arg m "$marker" '[.[] | select(.body | contains($m))] | last | .id // empty')"
+            payload="$(jq -n --arg body "$body" '{body: $body}')"
+            if [[ -n "$cid" ]]; then
+              curl -sS -X PATCH \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/comments/${cid}" \
+                -d "$payload" >/dev/null
+            else
+              curl -sS -X POST \
+                -H "Authorization: Bearer ${GH_TOKEN}" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${pr}/comments" \
+                -d "$payload" >/dev/null
+            fi
+          else
+            echo "comment is true, but this event has no pull request number. Wrote the table to the job summary only." >> "$summary"
+          fi
+        fi
+        if [[ "$failed" == "1" && "$FAIL_ON" != "never" ]]; then
+          exit 1
+        fi
